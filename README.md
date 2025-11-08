@@ -229,11 +229,3 @@ Check that:
 - CUDA is available (`torch.cuda.is_available()`)
 - You have write permissions in the report directory
 
-## 🗺️ Roadmap
-
-- [ ] Support for multi-GPU setups
-- [ ] Memory leak detection
-- [ ] Historical trend analysis
-- [ ] Integration with pytest-html
-- [ ] Real-time monitoring dashboard
-- [ ] Configurable thresholds and alerts
