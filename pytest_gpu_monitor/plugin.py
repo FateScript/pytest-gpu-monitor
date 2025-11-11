@@ -12,6 +12,18 @@ import pytest
 import torch
 
 GPU_MEMORY_DATA = []  # to store GPU memory data for all tests
+NUM_TESTS = 0
+
+
+def is_xdist_worker(request_or_session: pytest.FixtureRequest | pytest.Session) -> bool:
+    """Return `True` if this is an xdist worker, `False` otherwise."""
+    return hasattr(request_or_session.config, "workerinput")
+
+
+def pytest_xdist_node_collection_finished(node, ids):
+    """To count the total number of tests across all workers."""
+    global NUM_TESTS
+    NUM_TESTS = len(ids)
 
 
 def pytest_addoption(parser):
@@ -37,22 +49,35 @@ def pytest_addoption(parser):
     return parser
 
 
-def pytest_configure(config):
+def pytest_configure(config: pytest.Config):
     """config before tests start"""
     if not config.getoption("--gpu-monitor"):
         return
 
     global GPU_MEMORY_DATA
-    GPU_MEMORY_DATA = []
+    GPU_MEMORY_DATA = []  # reset data at the start of the session
 
-    # print GPU info at the start
+    # log info
+    # NOTE: pytest-xdist set `@pytest.hookimpl(trylast=True)` for `pytest_configure`
     if torch.cuda.is_available() and not config.getoption("--gpu-no-summary"):
         print(f"\n{'=' * 60}")
         print(f"GPU Device: {torch.cuda.get_device_name(0)}")
-        print(
-            f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB"
-        )
+        print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")  # noqa
+        if config.option.dist != "no":
+            print(f"Running with pytest-xdist: {config.option.numprocesses} workers")
         print(f"{'=' * 60}\n")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def assign_gpu_to_worker(request):
+    # xdist worker ID: gw0, gw1, etc.
+    if not torch.cuda.is_available():
+        return
+    worker_id = getattr(request.config, "workerinput", {}).get("workerid", "gw0")
+    gpu_id = int(worker_id.replace("gw", "")) % torch.cuda.device_count()
+
+    # os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    torch.cuda.set_device(gpu_id)
 
 
 @pytest.fixture(autouse=True)
@@ -90,6 +115,7 @@ def monitor_gpu_memory(request):
     final_reserved = torch.cuda.memory_reserved() / 1024**2
     peak_allocated = torch.cuda.max_memory_allocated() / 1024**2
     peak_reserved = torch.cuda.max_memory_reserved() / 1024**2
+    worker_id = getattr(config, "workerinput", {}).get("workerid", "gw0") if is_xdist_worker(request) else "master"  # noqa
 
     test_data = {
         "test_name": test_name,
@@ -102,30 +128,68 @@ def monitor_gpu_memory(request):
         "final_reserved_mb": round(final_reserved, 2),
         "peak_reserved_mb": round(peak_reserved, 2),
         "timestamp": datetime.now().isoformat(),
+        "worker_id": worker_id,
     }
 
-    GPU_MEMORY_DATA.append(test_data)
+    if is_xdist_worker(request):
+        report_dir = Path(config.getoption("--gpu-report-dir"))
+        report_dir.mkdir(exist_ok=True)
+        temp_dir = report_dir / ".temp"
+        temp_dir.mkdir(exist_ok=True)
+
+        temp_file = temp_dir / f"gpu_data_{worker_id}_{test_name.replace('::', '_').replace('/', '_')}.json"  # noqa
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(test_data, f, indent=2)
+    else:
+        GPU_MEMORY_DATA.append(test_data)
 
     # print summary (optional)
     if not config.getoption("--gpu-no-summary"):
         print(f"\n[GPU] {test_name}")
-        print(
-            f"  Peak Allocated: {peak_allocated:.2f} MB | Duration: {test_data['duration_seconds']:.3f}s"
-        )
+        print(f"  Peak Allocated: {peak_allocated:.2f} MB | Duration: {test_data['duration_seconds']:.3f}s")  # noqa
 
 
-def pytest_sessionfinish(session, exitstatus):
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """After all tests have finished, generate the report"""
-    config = session.config
+    # NOTE: `pytest_sessionfinish` is too early to read xdist data
+    use_xdist = config.option.dist != "no"
 
     if not config.getoption("--gpu-monitor"):
         return
 
-    if not torch.cuda.is_available() or not GPU_MEMORY_DATA:
+    if not torch.cuda.is_available():
         return
 
     report_dir = Path(config.getoption("--gpu-report-dir"))
     report_dir.mkdir(exist_ok=True)
+    temp_dir = report_dir / ".temp"
+
+    all_data = []
+
+    if use_xdist:
+        assert temp_dir.exists(), "Temp directory for xdist data not found"
+        num_files = 0
+        while num_files < NUM_TESTS:
+            local_files = list(temp_dir.glob("gpu_data_*.json"))
+            num_files += len(local_files)
+            for temp_file in local_files:
+                try:
+                    with open(temp_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        all_data.append(data)
+                except Exception as e:
+                    print(f"Warning: Failed to read {temp_file}: {e}")
+
+                try:  # rm file after reading
+                    temp_file.unlink()
+                except Exception as e:
+                    print(f"Warning: Failed to delete {temp_file}: {e}")
+    else:
+        all_data = GPU_MEMORY_DATA
+
+    if not all_data:  # no data collected
+        return
+
     # use fixed filename, overwrite each time
     json_file = report_dir / "gpu_memory_report.json"
     md_file = report_dir / "gpu_memory_report.md"
@@ -137,14 +201,16 @@ def pytest_sessionfinish(session, exitstatus):
         json.dump(
             {
                 "summary": {
-                    "total_tests": len(GPU_MEMORY_DATA),
+                    "total_tests": len(all_data),
                     "gpu_device": torch.cuda.get_device_name(0),
                     "total_gpu_memory_gb": round(
-                        torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
+                        torch.cuda.get_device_properties(0).total_memory / 1024**3,
+                        2,
                     ),
                     "timestamp": datetime.now().isoformat(),
+                    "xdist_enabled": config.option.dist != "no",
                 },
-                "tests": GPU_MEMORY_DATA,
+                "tests": all_data,
             },
             f,
             indent=2,
@@ -152,22 +218,14 @@ def pytest_sessionfinish(session, exitstatus):
         )
 
     # generate report
-    generate_markdown_report(md_file, GPU_MEMORY_DATA)
-    generate_csv_report(csv_file, GPU_MEMORY_DATA)
-    generate_html_report(html_file, GPU_MEMORY_DATA)
+    generate_markdown_report(md_file, all_data)
+    generate_csv_report(csv_file, all_data)
+    generate_html_report(html_file, all_data)
 
-    # summary
+    # top 5 memory consumers
     if not config.getoption("--gpu-no-summary"):
-        print(f"\n{'=' * 60}")
-        print("GPU Memory Report Generated:")
-        print(f"  JSON: {json_file}")
-        print(f"  Markdown: {md_file}")
-        print(f"  CSV: {csv_file}")
-        print(f"  HTML: {html_file}")
         print(f"{'=' * 60}\n")
-
-        # top 5 memory consumers
-        sorted_tests = sorted(GPU_MEMORY_DATA, key=lambda x: x["peak_allocated_mb"], reverse=True)
+        sorted_tests = sorted(all_data, key=lambda x: x["peak_allocated_mb"], reverse=True)
         print("\nTop 5 GPU Memory Consumers:")
         for i, test in enumerate(sorted_tests[:5], 1):
             print(f"  {i}. {test['test_name']}")
@@ -221,9 +279,7 @@ def generate_csv_report(filepath, data):
 def generate_html_report(filepath, data):
     # NOTE: this frontend code is generated by Kimi K2
     total_tests = len(data)
-    avg_peak = (
-        sum(t["peak_allocated_mb"] for t in data) / total_tests if total_tests else 0
-    )
+    avg_peak = sum(t["peak_allocated_mb"] for t in data) / total_tests if total_tests else 0
     max_peak = max(t["peak_allocated_mb"] for t in data) if data else 0
     total_duration = sum(t["duration_seconds"] for t in data)
 
