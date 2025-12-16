@@ -14,16 +14,22 @@ import torch
 GPU_MEMORY_DATA = []  # to store GPU memory data for all tests
 NUM_TESTS = 0
 
+try:
+    import xdist
+    assert hasattr(xdist, "plugin")
+
+    def pytest_xdist_node_collection_finished(node, ids):
+        """To count the total number of tests across all workers."""
+        global NUM_TESTS
+        NUM_TESTS = len(ids)
+
+except ImportError:
+    pass
+
 
 def is_xdist_worker(request_or_session: pytest.FixtureRequest | pytest.Session) -> bool:
     """Return `True` if this is an xdist worker, `False` otherwise."""
     return hasattr(request_or_session.config, "workerinput")
-
-
-def pytest_xdist_node_collection_finished(node, ids):
-    """To count the total number of tests across all workers."""
-    global NUM_TESTS
-    NUM_TESTS = len(ids)
 
 
 def pytest_addoption(parser):
@@ -41,10 +47,10 @@ def pytest_addoption(parser):
         help="Directory to save GPU memory reports (default: gpu_memory_reports)",
     )
     group.addoption(
-        "--gpu-no-summary",
+        "--gpu-summary",
         action="store_true",
         default=False,
-        help="Disable printing summary to console",
+        help="Enable printing summary to console",
     )
     return parser
 
@@ -59,7 +65,7 @@ def pytest_configure(config: pytest.Config):
 
     # log info
     # NOTE: pytest-xdist set `@pytest.hookimpl(trylast=True)` for `pytest_configure`
-    if torch.cuda.is_available() and not config.getoption("--gpu-no-summary"):
+    if torch.cuda.is_available() and not config.getoption("--gpu-summary"):
         print(f"\n{'=' * 60}")
         print(f"GPU Device: {torch.cuda.get_device_name(0)}")
         print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")  # noqa
@@ -86,13 +92,7 @@ def monitor_gpu_memory(request):
     config = request.config
 
     # skip if not using `--gpu-monitor` flag / CUDA not available
-    if not config.getoption("--gpu-monitor"):
-        yield
-        return
-
-    test_name = request.node.nodeid
-
-    if not torch.cuda.is_available():
+    if not config.getoption("--gpu-monitor") or not torch.cuda.is_available():
         yield
         return
 
@@ -103,13 +103,13 @@ def monitor_gpu_memory(request):
 
     initial_allocated = torch.cuda.memory_allocated() / 1024**2  # MB
     initial_reserved = torch.cuda.memory_reserved() / 1024**2
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     yield
 
     # synchronize and measure after test finishes
     torch.cuda.synchronize()
-    end_time = time.time()
+    end_time = time.perf_counter()
 
     final_allocated = torch.cuda.memory_allocated() / 1024**2
     final_reserved = torch.cuda.memory_reserved() / 1024**2
@@ -117,6 +117,7 @@ def monitor_gpu_memory(request):
     peak_reserved = torch.cuda.max_memory_reserved() / 1024**2
     worker_id = getattr(config, "workerinput", {}).get("workerid", "gw0") if is_xdist_worker(request) else "master"  # noqa
 
+    test_name = request.node.nodeid
     test_data = {
         "test_name": test_name,
         "duration_seconds": round(end_time - start_time, 3),
@@ -144,7 +145,7 @@ def monitor_gpu_memory(request):
         GPU_MEMORY_DATA.append(test_data)
 
     # print summary (optional)
-    if not config.getoption("--gpu-no-summary"):
+    if not config.getoption("--gpu-summary"):
         print(f"\n[GPU] {test_name}")
         print(f"  Peak Allocated: {peak_allocated:.2f} MB | Duration: {test_data['duration_seconds']:.3f}s")  # noqa
 
@@ -152,12 +153,9 @@ def monitor_gpu_memory(request):
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """After all tests have finished, generate the report"""
     # NOTE: `pytest_sessionfinish` is too early to read xdist data
-    use_xdist = config.option.dist != "no"
+    use_xdist = hasattr(config.option, "dist") and config.option.dist != "no"
 
-    if not config.getoption("--gpu-monitor"):
-        return
-
-    if not torch.cuda.is_available():
+    if not config.getoption("--gpu-monitor") or not torch.cuda.is_available():
         return
 
     report_dir = Path(config.getoption("--gpu-report-dir"))
@@ -165,7 +163,6 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     temp_dir = report_dir / ".temp"
 
     all_data = []
-
     if use_xdist:
         assert temp_dir.exists(), "Temp directory for xdist data not found"
         num_files = 0
@@ -198,24 +195,16 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
     # save detailed data in JSON format
     with open(json_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "summary": {
-                    "total_tests": len(all_data),
-                    "gpu_device": torch.cuda.get_device_name(0),
-                    "total_gpu_memory_gb": round(
-                        torch.cuda.get_device_properties(0).total_memory / 1024**3,
-                        2,
-                    ),
-                    "timestamp": datetime.now().isoformat(),
-                    "xdist_enabled": config.option.dist != "no",
-                },
-                "tests": all_data,
+        json.dump({
+            "summary": {
+                "total_tests": len(all_data),
+                "gpu_device": torch.cuda.get_device_name(0),
+                "total_gpu_memory_gb": round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2),  # noqa
+                "timestamp": datetime.now().isoformat(),
+                "xdist_enabled": use_xdist,
             },
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
+            "tests": all_data,
+        }, f, indent=2, ensure_ascii=False)
 
     # generate report
     generate_markdown_report(md_file, all_data)
@@ -223,7 +212,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     generate_html_report(html_file, all_data)
 
     # top 5 memory consumers
-    if not config.getoption("--gpu-no-summary"):
+    if not config.getoption("--gpu-summary"):
         print(f"{'=' * 60}\n")
         sorted_tests = sorted(all_data, key=lambda x: x["peak_allocated_mb"], reverse=True)
         print("\nTop 5 GPU Memory Consumers:")
