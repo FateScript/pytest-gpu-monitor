@@ -11,20 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 
-GPU_MEMORY_DATA = []  # to store GPU memory data for all tests
-NUM_TESTS = 0
-
-try:
-    import xdist
-    assert hasattr(xdist, "plugin")
-
-    def pytest_xdist_node_collection_finished(node, ids):
-        """To count the total number of tests across all workers."""
-        global NUM_TESTS
-        NUM_TESTS = len(ids)
-
-except ImportError:
-    pass
+GPU_MEMORY_DATA = []
 
 
 def is_xdist_worker(request_or_session: pytest.FixtureRequest | pytest.Session) -> bool:
@@ -120,7 +107,7 @@ def monitor_gpu_memory(request):
     test_name = request.node.nodeid
     test_data = {
         "test_name": test_name,
-        "duration_seconds": round(end_time - start_time, 3),
+        "duration_seconds": round(end_time - start_time, 4),
         "initial_allocated_mb": round(initial_allocated, 2),
         "final_allocated_mb": round(final_allocated, 2),
         "peak_allocated_mb": round(peak_allocated, 2),
@@ -132,22 +119,23 @@ def monitor_gpu_memory(request):
         "worker_id": worker_id,
     }
 
-    if is_xdist_worker(request):
-        report_dir = Path(config.getoption("--gpu-report-dir"))
-        report_dir.mkdir(exist_ok=True)
-        temp_dir = report_dir / ".temp"
-        temp_dir.mkdir(exist_ok=True)
+    request.node.gpu_memory_data = test_data
 
-        temp_file = temp_dir / f"gpu_data_{worker_id}_{test_name.replace('::', '_').replace('/', '_')}.json"  # noqa
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(test_data, f, indent=2)
-    else:
-        GPU_MEMORY_DATA.append(test_data)
 
-    # print summary (optional)
-    if not config.getoption("--gpu-summary"):
-        print(f"\n[GPU] {test_name}")
-        print(f"  Peak Allocated: {peak_allocated:.2f} MB | Duration: {test_data['duration_seconds']:.3f}s")  # noqa
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+
+    if report.when == "teardown" and hasattr(item, "gpu_memory_data"):
+        report.gpu_memory_data = item.gpu_memory_data
+
+
+def pytest_runtest_logreport(report):
+    """Collect report at controller side (xdist)"""
+    global GPU_MEMORY_DATA
+    if hasattr(report, "gpu_memory_data"):
+        GPU_MEMORY_DATA.append(report.gpu_memory_data)
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
@@ -160,31 +148,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
     report_dir = Path(config.getoption("--gpu-report-dir"))
     report_dir.mkdir(exist_ok=True)
-    temp_dir = report_dir / ".temp"
 
-    all_data = []
-    if use_xdist:
-        assert temp_dir.exists(), "Temp directory for xdist data not found"
-        num_files = 0
-        while num_files < NUM_TESTS:
-            local_files = list(temp_dir.glob("gpu_data_*.json"))
-            num_files += len(local_files)
-            for temp_file in local_files:
-                try:
-                    with open(temp_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        all_data.append(data)
-                except Exception as e:
-                    print(f"Warning: Failed to read {temp_file}: {e}")
-
-                try:  # rm file after reading
-                    temp_file.unlink()
-                except Exception as e:
-                    print(f"Warning: Failed to delete {temp_file}: {e}")
-    else:
-        all_data = GPU_MEMORY_DATA
-
-    if not all_data:  # no data collected
+    all_data = GPU_MEMORY_DATA
+    if not all_data:
         return
 
     # use fixed filename, overwrite each time
@@ -193,28 +159,28 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     csv_file = report_dir / "gpu_memory_report.csv"
     html_file = report_dir / "gpu_memory_report.html"
 
+    sorted_tests = sorted(all_data, key=lambda x: x["peak_allocated_mb"], reverse=True)
     # save detailed data in JSON format
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump({
             "summary": {
-                "total_tests": len(all_data),
+                "total_tests": len(sorted_tests),
                 "gpu_device": torch.cuda.get_device_name(0),
                 "total_gpu_memory_gb": round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2),  # noqa
                 "timestamp": datetime.now().isoformat(),
                 "xdist_enabled": use_xdist,
             },
-            "tests": all_data,
+            "tests": sorted_tests,
         }, f, indent=2, ensure_ascii=False)
 
     # generate report
-    generate_markdown_report(md_file, all_data)
-    generate_csv_report(csv_file, all_data)
-    generate_html_report(html_file, all_data)
+    generate_markdown_report(md_file, sorted_tests)
+    generate_csv_report(csv_file, sorted_tests)
+    generate_html_report(html_file, sorted_tests)
 
     # top 5 memory consumers
     if not config.getoption("--gpu-summary"):
         print(f"{'=' * 60}\n")
-        sorted_tests = sorted(all_data, key=lambda x: x["peak_allocated_mb"], reverse=True)
         print("\nTop 5 GPU Memory Consumers:")
         for i, test in enumerate(sorted_tests[:5], 1):
             print(f"  {i}. {test['test_name']}")
